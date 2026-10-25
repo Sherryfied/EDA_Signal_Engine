@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan to fix the Signal Discovery Radar:\n1. Fix repetitive account scans by tracking excluded IDs across tracked and discovered accounts, rotating pool indexes, and synthesizing fresh high-intent accounts via Gemini AI when the catalog is exhausted.\n2. Add multi-select checkboxes (including 'Select All' and individual selection) to the Signal Discovery Radar table.\n3. Add a batch action 'Add Selected to Tracked Target Accounts' with instant promotion, removing promoted accounts from the Radar view as requested.\n4. Comprehensive QA & verification.",
+  "updatedAt":  "2026-10-25T08:53:22.824445848Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

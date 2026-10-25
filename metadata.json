@@ -1,0 +1,6 @@
+{
+  "name": "TeamEDA SignalPulse - AI Buying Signal & Intent Detection",
+  "description": "AI-driven Go-To-Market intent and buying signal detection system for TeamEDA LAMUM, tracking CAD/EDA licensing bottlenecks, facility expansions, and renewal urgency.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
