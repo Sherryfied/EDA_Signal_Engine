@@ -17,8 +17,6 @@ export const SignalModal: React.FC<SignalModalProps> = ({
   patterns,
   onAddSignal,
 }) => {
-  if (!isOpen) return null;
-
   const [accountId, setAccountId] = useState(accounts[0]?.id || '');
   const [patternId, setPatternId] = useState(patterns[0]?.id || '');
   const [title, setTitle] = useState('');
@@ -26,6 +24,9 @@ export const SignalModal: React.FC<SignalModalProps> = ({
   const [rawSnippet, setRawSnippet] = useState('');
   const [source, setSource] = useState<SignalSource>('Job Board');
   const [priority, setPriority] = useState<PriorityLevel>('High');
+
+  // Guard JSX rendering: hooks are already called unconditionally above
+  if (!isOpen) return null;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();

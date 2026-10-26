@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Account, BuyingSignal, SourceCitation } from '../types.ts';
 import {
   X,
@@ -104,29 +104,45 @@ export const AccountDrawer: React.FC<AccountDrawerProps> = ({
   onDispatchAlert,
   onUpdateAccount,
 }) => {
-  if (!account) return null;
-
   const [isValidating, setIsValidating] = useState(false);
   const [validationSuccess, setValidationSuccess] = useState<string | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
 
-  // Edit form states
-  const [editSeats, setEditSeats] = useState(account.edaEngineersCount);
-  const [editTotalEng, setEditTotalEng] = useState(account.totalEngineersEstimate || account.edaEngineersCount * 3);
-  const [editCompetitor, setEditCompetitor] = useState(account.currentEsamTool);
-  const [editDaemons, setEditDaemons] = useState(account.licenseDaemons.join(', '));
-  const [editTools, setEditTools] = useState(account.edaTools.join(', '));
+  // Edit form states with safe fallback initialization
+  const [editSeats, setEditSeats] = useState(account?.edaEngineersCount ?? 0);
+  const [editTotalEng, setEditTotalEng] = useState(account?.totalEngineersEstimate ?? (account?.edaEngineersCount ? account.edaEngineersCount * 3 : 0));
+  const [editCompetitor, setEditCompetitor] = useState(account?.currentEsamTool ?? '');
+  const [editDaemons, setEditDaemons] = useState(account?.licenseDaemons?.join(', ') ?? '');
+  const [editTools, setEditTools] = useState(account?.edaTools?.join(', ') ?? '');
 
-  const accountSignals = signals.filter((s) => s.accountId === account.id);
-  const isRenewalNear = account.renewalDaysLeft <= 90;
-  const isOpenLM = account.currentEsamTool.toLowerCase().includes('openlm');
-  const isFlexera = account.currentEsamTool.toLowerCase().includes('flexera');
-  const citations = getAccountCitations(account);
+  // Synchronize draft edits whenever the selected account changes (QAS-007)
+  useEffect(() => {
+    if (account) {
+      setEditSeats(account.edaEngineersCount);
+      setEditTotalEng(account.totalEngineersEstimate || account.edaEngineersCount * 3);
+      setEditCompetitor(account.currentEsamTool);
+      setEditDaemons(account.licenseDaemons?.join(', ') || '');
+      setEditTools(account.edaTools?.join(', ') || '');
+      setIsEditing(false);
+      setValidationSuccess(null);
+      setValidationError(null);
+    }
+  }, [account?.id, account?.headcountConfidence]);
+
+  // Safe computed attributes
+  const accountSignals = account ? signals.filter((s) => s.accountId === account.id) : [];
+  const isRenewalNear = account ? account.renewalDaysLeft <= 90 : false;
+  const isOpenLM = account ? account.currentEsamTool.toLowerCase().includes('openlm') : false;
+  const isFlexera = account ? account.currentEsamTool.toLowerCase().includes('flexera') : false;
+  const citations = account ? getAccountCitations(account) : [];
 
   // Trigger live AI validation grounded in public engineering requisitions & deterministic daemons
   const handleLiveRevalidate = async () => {
+    if (!account) return;
     setIsValidating(true);
     setValidationSuccess(null);
+    setValidationError(null);
     try {
       const response = await fetch('/api/validate-engineer-headcount', {
         method: 'POST',
@@ -136,7 +152,7 @@ export const AccountDrawer: React.FC<AccountDrawerProps> = ({
 
       const contentType = response.headers.get('content-type') || '';
       if (!response.ok || !contentType.includes('application/json')) {
-        throw new Error('Validation request failed');
+        throw new Error(`Validation service returned HTTP ${response.status}`);
       }
 
       const result = await response.json();
@@ -176,10 +192,11 @@ export const AccountDrawer: React.FC<AccountDrawerProps> = ({
         setValidationSuccess('Headcount & evidence citations verified against official SEC 10-K & requisition records!');
         setTimeout(() => setValidationSuccess(null), 4000);
       }
-    } catch (err) {
-      console.error(err);
-      setValidationSuccess('Re-validated against technical daemon architecture benchmarks.');
-      setTimeout(() => setValidationSuccess(null), 3000);
+    } catch (err: any) {
+      console.error('Validation request failed:', err);
+      // QAS-010: Surface explicit failure notice rather than misleading success
+      setValidationError('Validation service temporarily unreachable. Stored verified records retained.');
+      setTimeout(() => setValidationError(null), 4500);
     } finally {
       setIsValidating(false);
     }
@@ -187,7 +204,7 @@ export const AccountDrawer: React.FC<AccountDrawerProps> = ({
 
   const handleSaveManualEdit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!onUpdateAccount) return;
+    if (!account || !onUpdateAccount) return;
 
     const updated: Account = {
       ...account,
@@ -210,6 +227,9 @@ export const AccountDrawer: React.FC<AccountDrawerProps> = ({
     setValidationSuccess('Manual enterprise telemetry override saved successfully.');
     setTimeout(() => setValidationSuccess(null), 3000);
   };
+
+  // Guard JSX rendering: hooks are already called unconditionally above
+  if (!account) return null;
 
   return (
     <div className="fixed inset-0 z-50 overflow-hidden bg-slate-900/40 backdrop-blur-xs flex justify-end">
@@ -280,6 +300,14 @@ export const AccountDrawer: React.FC<AccountDrawerProps> = ({
             <div className="mt-3 p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-md text-xs flex items-center gap-2">
               <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
               <span>{validationSuccess}</span>
+            </div>
+          )}
+
+          {/* Validation Error Notification (QAS-010) */}
+          {validationError && (
+            <div className="mt-3 p-2.5 bg-rose-50 border border-rose-200 text-rose-800 rounded-md text-xs flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{validationError}</span>
             </div>
           )}
 

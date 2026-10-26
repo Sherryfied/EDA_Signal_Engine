@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { SCANNER_SAMPLE_PRESETS } from '../data/seedData.ts';
+import { TrackedPattern } from '../types.ts';
 import {
   Sparkles,
   Loader2,
@@ -16,11 +17,17 @@ import {
 interface ScannerViewProps {
   onApplyDetectedSignal?: (analysis: any) => void;
   onDraftOutreachForAnalysis?: (analysis: any) => void;
+  trackedPatterns?: TrackedPattern[];
+  initialPattern?: TrackedPattern | null;
+  onClearInitialPattern?: () => void;
 }
 
 export const ScannerView: React.FC<ScannerViewProps> = ({
   onApplyDetectedSignal,
   onDraftOutreachForAnalysis,
+  trackedPatterns,
+  initialPattern,
+  onClearInitialPattern,
 }) => {
   const [inputMode, setInputMode] = useState<'automated' | 'manual' | 'bulk'>('automated');
   const [inputText, setInputText] = useState(SCANNER_SAMPLE_PRESETS[0].text);
@@ -31,6 +38,17 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   const [bulkResults, setBulkResults] = useState<any[] | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [accountAddedToast, setAccountAddedToast] = useState(false);
+
+  // Synchronize test snippet when a rule is sent via "Test in Scanner" (QAS-006)
+  useEffect(() => {
+    if (initialPattern) {
+      setInputMode('automated');
+      const testKeywords = initialPattern.regexPatterns?.length ? initialPattern.regexPatterns.join(', ') : initialPattern.name;
+      const testSnippet = `Corporate Engineering Disclosure: Raytheon Systems announced a major new engineering facility and R&D expansion. Engineering headcount is expanding by 40 engineers to support CAD software, Synopsys Design Compiler, and Cadence Virtuoso implementations under FlexNet floating license servers. Focus: ${testKeywords}.`;
+      setInputText(testSnippet);
+      setAnalysisResult(null);
+    }
+  }, [initialPattern]);
 
   // Bulk input text state
   const [bulkText, setBulkText] = useState(
@@ -53,6 +71,17 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       if (inputMode === 'manual') {
         if (companyName.trim()) payload.accountName = companyName;
         if (sourceType !== 'Auto-Detect from Text') payload.source = sourceType;
+      }
+
+      // QAS-006: Supply active custom rules to engine
+      if (trackedPatterns && trackedPatterns.length > 0) {
+        payload.customRules = trackedPatterns.map((p) => ({
+          name: p.name,
+          keywords: p.regexPatterns,
+          priority: p.priority,
+          formula: p.interpretation,
+          scoreImpact: p.weight,
+        }));
       }
 
       const response = await fetch('/api/analyze-signal', {
@@ -91,10 +120,21 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     const results: any[] = [];
     try {
       for (const chunk of chunks) {
+        const payload: any = { text: chunk };
+        if (trackedPatterns && trackedPatterns.length > 0) {
+          payload.customRules = trackedPatterns.map((p) => ({
+            name: p.name,
+            keywords: p.regexPatterns,
+            priority: p.priority,
+            formula: p.interpretation,
+            scoreImpact: p.weight,
+          }));
+        }
+
         const response = await fetch('/api/analyze-signal', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: chunk }),
+          body: JSON.stringify(payload),
         });
         const contentType = response.headers.get('content-type') || '';
         if (response.ok && contentType.includes('application/json')) {

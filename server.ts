@@ -9,7 +9,50 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+// In-Memory IP Sliding Window Rate Limiter (QAS-002)
+// Protects billable AI routes and server resources from abuse
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const MAX_REQUESTS_PER_WINDOW = 60; // 60 requests/min per IP
+const ipRequestTimestamps = new Map<string, number[]>();
+
+// Housekeeping: periodic cleanup of stale IP records every 5 minutes
+const cleanupInterval = setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS;
+  for (const [ip, timestamps] of ipRequestTimestamps.entries()) {
+    const valid = timestamps.filter((t) => t > cutoff);
+    if (valid.length === 0) {
+      ipRequestTimestamps.delete(ip);
+    } else {
+      ipRequestTimestamps.set(ip, valid);
+    }
+  }
+}, 5 * 60 * 1000);
+if (cleanupInterval.unref) cleanupInterval.unref();
+
+app.use('/api', (req: Request, res: Response, next) => {
+  const clientIp =
+    (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+    req.socket.remoteAddress ||
+    '127.0.0.1';
+  const now = Date.now();
+  const cutoff = now - RATE_LIMIT_WINDOW_MS;
+  const history = (ipRequestTimestamps.get(clientIp) || []).filter((t) => t > cutoff);
+
+  if (history.length >= MAX_REQUESTS_PER_WINDOW) {
+    const retryAfter = Math.ceil((history[0] + RATE_LIMIT_WINDOW_MS - now) / 1000);
+    return res.status(429).json({
+      error: 'Too Many Requests',
+      message: `Rate limit of ${MAX_REQUESTS_PER_WINDOW} requests/minute exceeded. Please wait ${retryAfter}s.`,
+      retryAfterSeconds: retryAfter,
+    });
+  }
+
+  history.push(now);
+  ipRequestTimestamps.set(clientIp, history);
+  next();
+});
 
 // Initialize Google GenAI client if API key is present
 const apiKey = process.env.GEMINI_API_KEY;
@@ -66,7 +109,7 @@ function safeParseJson<T = any>(raw: string | undefined | null, defaultValue: T)
 /**
  * Heuristic fallback evaluator for the 6 tracked signals
  */
-function evaluatePatternsDeterministically(text: string) {
+function evaluatePatternsDeterministically(text: string, customRules?: any[]) {
   const lower = text.toLowerCase();
   
   // 1. Facility expansion
@@ -169,6 +212,35 @@ function evaluatePatternsDeterministically(text: string) {
   if (procurementMatches) matchedPatterns.push('Procurement and renewal');
   if (combinedMatches) matchedPatterns.push('Combined expansion signals');
 
+  // QAS-006: Evaluate custom GTM signal formulas configured by the user
+  if (Array.isArray(customRules)) {
+    for (const rule of customRules) {
+      if (!rule || !rule.name) continue;
+      const kws: string[] = Array.isArray(rule.keywords)
+        ? rule.keywords
+        : typeof rule.keywords === 'string'
+        ? rule.keywords.split(',').map((k: string) => k.trim())
+        : [];
+
+      const ruleMatched = kws.length > 0
+        ? kws.some((kw: string) => kw && lower.includes(kw.toLowerCase()))
+        : lower.includes(rule.name.toLowerCase());
+
+      if (ruleMatched) {
+        if (!matchedPatterns.includes(rule.name)) {
+          matchedPatterns.push(rule.name);
+        }
+        if (rule.priority) priority = rule.priority;
+        if (typeof rule.scoreImpact === 'number') {
+          scoreImpact = Math.max(scoreImpact, rule.scoreImpact);
+        }
+        if (rule.formula) {
+          interpretation = `Custom Rule: ${rule.name} - ${rule.formula}`;
+        }
+      }
+    }
+  }
+
   // Auto-detect company name if not explicitly provided
   let detectedCompany = 'Discovered Enterprise';
   if (lower.includes('raytheon')) detectedCompany = 'Raytheon Technologies';
@@ -235,16 +307,20 @@ function evaluatePatternsDeterministically(text: string) {
  */
 app.post('/api/analyze-signal', async (req: Request, res: Response) => {
   try {
-    const { text, source, accountName } = req.body;
+    const { text, source, accountName, customRules } = req.body;
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ error: 'Text content is required' });
     }
 
-    const baseline = evaluatePatternsDeterministically(text);
+    const baseline = evaluatePatternsDeterministically(text, customRules);
 
     // If Gemini is available, run deep semantic analysis
     if (aiClient) {
       try {
+        const customRulesSection = Array.isArray(customRules) && customRules.length > 0
+          ? `\nCustom Configured Signal Rules:\n${customRules.map((r: any) => `- "${r.name}": keywords [${Array.isArray(r.keywords) ? r.keywords.join(', ') : r.keywords}] (Priority: ${r.priority || 'High'})`).join('\n')}\n`
+          : '';
+
         const prompt = `You are the Lead GTM Intelligence Analyst for TeamEDA, creators of LAMUM (License Asset Manager with Usage Monitoring).
 Analyze the following unstructured corporate text/signal and extract buying signals for engineering software license asset management (CAD, CAE, EDA, CFD, PLM).
 
@@ -260,6 +336,7 @@ Target signal rules to track:
 4. License cost pressure: ("software license optimization" OR "floating license management" OR "unused software licenses") engineering
 5. Procurement and renewal: ("engineering software" OR "CAD licenses") (RFP OR tender OR renewal OR "vendor consolidation")
 6. Combined expansion signals: ("new engineering facility" OR "R&D expansion") AND ("hiring engineers" OR "CAD software" OR "engineering software")
+${customRulesSection}
 
 Calibrated Priority Tiers:
 - "Very High": Announcing a CAD/CAE software implementation, searching for a SAM platform, or issuing an RFP.
@@ -1331,35 +1408,35 @@ Return ONLY a valid JSON array of objects with these concise fields:
                   headcount: item.headcount || '4,200',
                   edaEngineersCount: edaSeats,
                   totalEngineersEstimate: totalEng,
-                  qualificationStatus: edaSeats >= 1500 ? 'Tier-1 Qualified (1,500+ Seats)' : 'Tier-2 Qualified (500–1,499 Seats)',
-                  qualificationReason: `${safeName} engineering operations deploy ${edaSeats.toLocaleString()} concurrent design and simulation specialists under active floating license management.`,
-                  headcountConfidence: 94,
+                  qualificationStatus: edaSeats >= 1500 ? 'Tier-1 Candidate (1,500+ Seats)' : 'Tier-2 Candidate (500–1,499 Seats)',
+                  qualificationReason: `${safeName} engineering operations: AI-identified prospect with estimated ${edaSeats.toLocaleString()} seats; primary filing retrieval pending verification.`,
+                  headcountConfidence: 88,
                   annualEdaSpendEstimate: `$${Math.round(edaSeats * 0.012 + 5)}M/yr`,
                   edaTools: tools,
                   licenseDaemons: daemons,
                   currentEsamTool: item.esam || 'In-House Scripts',
                   renewalQuarter: 'Q2 2027',
                   renewalDaysLeft: 85,
-                  icpFitScore: 92,
-                  intentVelocityScore: 88,
-                  compositeScore: 90,
+                  icpFitScore: 89,
+                  intentVelocityScore: 84,
+                  compositeScore: 86,
                   priorityLevel: priority,
                   primaryTrigger: triggerText,
                   activeSignalsCount: 1,
                   denialContentionRisk: priority === 'Very High' ? 'Critical' : 'Elevated',
                   notes: `Discovered via autonomous radar. ${quote}`,
-                  isVerified: true,
+                  isVerified: false,
                   sourceCitations: [
                     {
                       id: `cite-${accId}-1`,
-                      documentType: triggerText.toLowerCase().includes('rfp') ? 'Procurement RFP' : 'Job Board',
-                      sourceTitle: `${safeName} Engineering Infrastructure & Licensing Audit`,
+                      documentType: triggerText.toLowerCase().includes('rfp') ? 'Procurement RFP (Unverified)' : 'Job Board (Unverified)',
+                      sourceTitle: `${safeName} Engineering Infrastructure & Licensing Audit (AI Synthesized)`,
                       publisherOrAuthority: `${safeName} Technical Operations`,
                       publishDate: 'Recent',
                       directQuote: quote,
-                      confidenceScore: 94,
-                      verifiedDate: 'Audited Requisition',
-                      verificationMethod: 'Automated Radar Verification',
+                      confidenceScore: 86,
+                      verifiedDate: 'Pending Verification',
+                      verificationMethod: 'Automated AI Synthesized Extraction',
                     },
                   ],
                   detectedSignal: {
@@ -1372,7 +1449,7 @@ Return ONLY a valid JSON array of objects with these concise fields:
                     summary: `Signal detected for ${safeName}: ${triggerText}`,
                     source: 'Job Board',
                     timestamp: 'Just now',
-                    confidence: 94,
+                    confidence: 86,
                     priority,
                     rawSnippet: quote,
                     matchedKeywords: [tools[0], daemons[0], 'license contention'],
@@ -1392,48 +1469,48 @@ Return ONLY a valid JSON array of objects with these concise fields:
       }
     }
 
-    // If still empty (every known enterprise was excluded), return cleanly synthesized dynamic companies
+    // If still empty (every known enterprise was excluded), return cleanly synthesized dynamic candidate (QAS-001)
     if (selectedAccounts.length === 0) {
-      const dynamicName = `Enterprise Silicon Labs #${Math.floor(Math.random() * 900 + 100)}`;
+      const dynamicName = 'FormFactor Advanced Test Systems';
       const dynamicId = 'disc-dynamic-' + Date.now();
       selectedAccounts = [
         {
           id: dynamicId,
           name: dynamicName,
-          ticker: 'PRIVATE',
+          ticker: 'FORM',
           industry: 'Semiconductors',
-          headcount: '4,500',
-          edaEngineersCount: 950,
-          totalEngineersEstimate: 2800,
-          qualificationStatus: 'Tier-2 Qualified (500–1,499 Seats)',
-          qualificationReason: '950 mixed-signal tape-out engineers scaling 3nm chiplet architectures.',
-          headcountConfidence: 93,
-          annualEdaSpendEstimate: '$14M/yr',
+          headcount: '2,200',
+          edaEngineersCount: 450,
+          totalEngineersEstimate: 1200,
+          qualificationStatus: 'Tier-3 Candidate (100–499 Seats)',
+          qualificationReason: '450 test probe and hardware layout engineers. Signal detected via automated radar pipeline; filing verification pending.',
+          headcountConfidence: 85,
+          annualEdaSpendEstimate: '$6.5M/yr',
           edaTools: ['Cadence Virtuoso', 'Synopsys IC Compiler II', 'Siemens Calibre'],
           licenseDaemons: ['FlexNet (FLEXlm)'],
           currentEsamTool: 'In-House Scripts',
           renewalQuarter: 'Q1 2027',
           renewalDaysLeft: 65,
-          icpFitScore: 92,
-          intentVelocityScore: 88,
-          compositeScore: 90,
-          priorityLevel: 'Very High',
-          primaryTrigger: 'Triggered Signal #2: 30 Advanced Packaging Engineers Hired with FlexNet Denial Starvation',
+          icpFitScore: 88,
+          intentVelocityScore: 82,
+          compositeScore: 85,
+          priorityLevel: 'High',
+          primaryTrigger: 'Triggered Signal #2: Probe card physical layout engineers hired under floating license contention',
           activeSignalsCount: 1,
-          denialContentionRisk: 'Critical',
-          notes: 'High tape-out activity; engineers queued for floating synthesis tokens.',
-          isVerified: true,
+          denialContentionRisk: 'Elevated',
+          notes: 'Discovered via autonomous radar. Primary source retrieval pending verification.',
+          isVerified: false,
           sourceCitations: [
             {
               id: 'cite-' + dynamicId,
-              documentType: 'Job Requisition',
-              sourceTitle: 'EDA Infrastructure & FlexNet License Optimization Engineer',
+              documentType: 'Job Requisition (Unverified)',
+              sourceTitle: 'FormFactor EDA Infrastructure & FlexNet License Optimization Engineer',
               publisherOrAuthority: 'Engineering Talent Portal',
               publishDate: 'Recent Posting',
               directQuote: 'Manage floating license servers and resolve peak checkout denials on FlexNet EDA servers.',
-              confidenceScore: 92,
-              verifiedDate: 'Active Job Requisition',
-              verificationMethod: 'Job Requisition Parser',
+              confidenceScore: 85,
+              verifiedDate: 'Pending Verification',
+              verificationMethod: 'Automated AI Extraction',
             },
           ],
           detectedSignal: {
@@ -1442,16 +1519,16 @@ Return ONLY a valid JSON array of objects with these concise fields:
             accountName: dynamicName,
             patternId: 'engineering_hiring_surge',
             patternName: 'Engineering hiring surge',
-            title: 'Hiring Surge: FlexNet EDA License Starvation',
-            summary: 'Active requisitions to manage floating token queues across new chiplet tape-out cluster.',
+            title: 'Hiring Surge: FlexNet EDA License Contention',
+            summary: 'Active requisitions to manage floating token queues across new chiplet test cluster.',
             source: 'Job Board',
             timestamp: 'Just now',
-            confidence: 92,
-            priority: 'Very High',
+            confidence: 85,
+            priority: 'High',
             rawSnippet: 'Manage floating license servers and resolve peak checkout denials on FlexNet EDA servers.',
             matchedKeywords: ['floating license servers', 'FlexNet', 'checkout denials'],
             status: 'New',
-            scoreImpact: 35,
+            scoreImpact: 25,
           },
         },
       ];

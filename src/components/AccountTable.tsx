@@ -187,22 +187,6 @@ export const AccountTable: React.FC<AccountTableProps> = ({
   const [selectedDiscoveredIds, setSelectedDiscoveredIds] = useState<Set<string>>(new Set());
   const masterCheckboxRef = useRef<HTMLInputElement | null>(null);
 
-  // Sync / prune selected IDs when discovered dataset changes or view switches
-  useEffect(() => {
-    if (activeAccountView !== 'discovered') {
-      setSelectedDiscoveredIds(new Set());
-    } else {
-      const validIds = new Set(discoveredAccounts.map((a) => a.id));
-      setSelectedDiscoveredIds((prev) => {
-        const next = new Set<string>();
-        prev.forEach((id) => {
-          if (validIds.has(id)) next.add(id);
-        });
-        return next;
-      });
-    }
-  }, [discoveredAccounts, activeAccountView]);
-
   const currentDataset = activeAccountView === 'tracked' ? accounts : discoveredAccounts;
 
   // Filtered & Sorted Accounts with Bulletproof Null/Undefined Guards
@@ -315,6 +299,27 @@ export const AccountTable: React.FC<AccountTableProps> = ({
     return `$${Math.round(totalMillions)}M`;
   }, [accounts]);
 
+  // QAS-011: Sync / prune selected IDs strictly to currently visible filtered accounts
+  useEffect(() => {
+    if (activeAccountView !== 'discovered') {
+      setSelectedDiscoveredIds(new Set());
+    } else {
+      const visibleIds = new Set(filteredAccounts.map((a) => a.id));
+      setSelectedDiscoveredIds((prev) => {
+        let hasChanged = false;
+        const next = new Set<string>();
+        prev.forEach((id) => {
+          if (visibleIds.has(id)) {
+            next.add(id);
+          } else {
+            hasChanged = true;
+          }
+        });
+        return hasChanged ? next : prev;
+      });
+    }
+  }, [filteredAccounts, activeAccountView]);
+
   // Selection computed helpers
   const isAllDiscoveredSelected = useMemo(() => {
     if (filteredAccounts.length === 0) return false;
@@ -354,7 +359,9 @@ export const AccountTable: React.FC<AccountTableProps> = ({
 
   const handleBatchPromoteSelected = () => {
     if (selectedDiscoveredIds.size === 0) return;
-    const ids = Array.from(selectedDiscoveredIds);
+    const visibleIds = new Set(filteredAccounts.map((a) => a.id));
+    const ids = Array.from(selectedDiscoveredIds).filter((id) => visibleIds.has(id));
+    if (ids.length === 0) return;
     if (onBatchPromoteDiscoveredAccounts) {
       onBatchPromoteDiscoveredAccounts(ids);
     } else {
@@ -515,7 +522,7 @@ export const AccountTable: React.FC<AccountTableProps> = ({
               {selectedDiscoveredIds.size > 0 ? (
                 <>
                   <span className="font-bold text-sm bg-white/20 px-2.5 py-0.5 rounded">
-                    {selectedDiscoveredIds.size} of {filteredAccounts.length} Selected
+                    {selectedDiscoveredIds.size} of {filteredAccounts.length} Visible Selected
                   </span>
                   <span className="text-blue-100 hidden md:inline">
                     · Ready to add to Active Tracked Target Accounts
@@ -524,10 +531,10 @@ export const AccountTable: React.FC<AccountTableProps> = ({
               ) : (
                 <>
                   <span className="font-semibold text-slate-900">
-                    Select All ({filteredAccounts.length} Discovered Accounts)
+                    Select All ({filteredAccounts.length} Visible Discovered Accounts)
                   </span>
                   <span className="text-slate-500 hidden md:inline">
-                    · Check individual rows or click 'Select All' to batch promote into Active Tracked Accounts
+                    · Check individual rows or click 'Select All' to batch promote visible accounts
                   </span>
                 </>
               )}

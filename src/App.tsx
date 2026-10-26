@@ -23,6 +23,7 @@ import { SignalModal } from './components/SignalModal.tsx';
 import { ImportExportModal } from './components/ImportExportModal.tsx';
 import { SignalRulesManager } from './components/SignalRulesManager.tsx';
 import { CheckCircle2, BellRing } from 'lucide-react';
+import { safeLoadStorage } from './utils/storageUtils.ts';
 
 const INITIAL_DISCOVERED: Account[] = [
   {
@@ -200,62 +201,28 @@ const INITIAL_DISCOVERED: Account[] = [
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'accounts' | 'calibration' | 'rules' | 'scanner' | 'playbooks'>('accounts');
+  const [scannerTestPattern, setScannerTestPattern] = useState<TrackedPattern | null>(null);
 
-  const [accounts, setAccounts] = useState<Account[]>(() => {
-    const saved = localStorage.getItem('teameda_accounts');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length >= SEED_ACCOUNTS.length) {
-          return parsed;
-        }
-      } catch (e) {
-        console.error('Failed to parse cached accounts, reverting to seeds:', e);
-      }
-    }
-    return SEED_ACCOUNTS;
-  });
+  // Safe localStorage Hydration Guards (QAS-008)
+  const [accounts, setAccounts] = useState<Account[]>(() =>
+    safeLoadStorage<Account[]>('teameda_accounts', SEED_ACCOUNTS, (val) => Array.isArray(val) && val.length > 0)
+  );
 
-  const [discoveredAccounts, setDiscoveredAccounts] = useState<Account[]>(() => {
-    const saved = localStorage.getItem('teameda_discovered_accounts');
-    return saved ? JSON.parse(saved) : INITIAL_DISCOVERED;
-  });
+  const [discoveredAccounts, setDiscoveredAccounts] = useState<Account[]>(() =>
+    safeLoadStorage<Account[]>('teameda_discovered_accounts', INITIAL_DISCOVERED, (val) => Array.isArray(val))
+  );
 
-  const [signals, setSignals] = useState<BuyingSignal[]>(() => {
-    const saved = localStorage.getItem('teameda_signals');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length >= SEED_SIGNALS.length) {
-          return parsed;
-        }
-      } catch (e) {
-        console.error('Failed to parse cached signals:', e);
-      }
-    }
-    return SEED_SIGNALS;
-  });
+  const [signals, setSignals] = useState<BuyingSignal[]>(() =>
+    safeLoadStorage<BuyingSignal[]>('teameda_signals', SEED_SIGNALS, (val) => Array.isArray(val) && val.length > 0)
+  );
 
-  const [trackedPatterns, setTrackedPatterns] = useState<TrackedPattern[]>(() => {
-    const saved = localStorage.getItem('teameda_tracked_patterns');
-    return saved ? JSON.parse(saved) : TRACKED_PATTERNS;
-  });
+  const [trackedPatterns, setTrackedPatterns] = useState<TrackedPattern[]>(() =>
+    safeLoadStorage<TrackedPattern[]>('teameda_tracked_patterns', TRACKED_PATTERNS, (val) => Array.isArray(val) && val.length > 0)
+  );
 
   // Autonomous Background Polling Configuration State
-  const [autonomousConfig, setAutonomousConfig] = useState<AutonomousScanConfig>(() => {
-    const saved = localStorage.getItem('teameda_scan_config');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return {
-          ...parsed,
-          autoIngestDirectly: parsed.autoIngestDirectly ?? true,
-        };
-      } catch (e) {
-        console.error('Failed to parse scan config:', e);
-      }
-    }
-    return {
+  const [autonomousConfig, setAutonomousConfig] = useState<AutonomousScanConfig>(() =>
+    safeLoadStorage<AutonomousScanConfig>('teameda_scan_config', {
       isEnabled: true,
       intervalMinutes: 15,
       lastPolledAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -264,20 +231,12 @@ export default function App() {
       autoIngestDirectly: true,
       scannedVerticals: ['Semiconductors', 'Aerospace & Defense', 'Automotive', 'Industrial Hardware', 'Hyperscale Silicon'],
       totalAutonomousIngested: 0,
-    };
-  });
+    })
+  );
 
   // Discovered Notifications Stream
-  const [notifications, setNotifications] = useState<AutonomousNotification[]>(() => {
-    const saved = localStorage.getItem('teameda_notifications');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error('Failed to parse notifications:', e);
-      }
-    }
-    return [
+  const [notifications, setNotifications] = useState<AutonomousNotification[]>(() =>
+    safeLoadStorage<AutonomousNotification[]>('teameda_notifications', [
       {
         id: 'notif-mrvl-1',
         timestamp: '15m ago',
@@ -298,8 +257,8 @@ export default function App() {
         priority: 'High',
         account: INITIAL_DISCOVERED[1],
       },
-    ];
-  });
+    ], (val) => Array.isArray(val))
+  );
 
   const [dispatchedAlerts, setDispatchedAlerts] = useState<WebhookAlert[]>([]);
   const [selectedDrawerAccount, setSelectedDrawerAccount] = useState<Account | null>(null);
@@ -517,7 +476,9 @@ export default function App() {
   };
 
   const handleSweepAllVerticals = () => {
-    pollBackgroundRadar(true, true);
+    // QAS-012: Directly auto-ingest all swept accounts into Active Tracked Accounts per user specification
+    pollBackgroundRadar(false, true);
+    showToast('Sweeping all 5 verticals: direct auto-ingestion to Tracked Target Accounts initiated...');
   };
 
   const handleMarkNotificationAsRead = (id: string) => {
@@ -567,13 +528,23 @@ export default function App() {
     showToast('Reset tracked signal formulas to default 6 canonical templates.');
   };
 
-  // Promote an auto-discovered account into tracked target accounts
+  // Promote an auto-discovered account into tracked target accounts (QAS-005)
   const handlePromoteDiscoveredAccount = (account: Account) => {
-    if (!accounts.some((a) => a.id === account.id || a.name.toLowerCase() === account.name.toLowerCase())) {
+    const isKnown = accounts.some(
+      (a) => a.id === account.id || a.name.toLowerCase() === account.name.toLowerCase()
+    );
+    if (!isKnown) {
       setAccounts((prev) => [account, ...prev]);
     }
+    const detectedSig = (account as any).detectedSignal;
+    if (detectedSig) {
+      setSignals((prev) => {
+        if (prev.some((s) => s.id === detectedSig.id)) return prev;
+        return [detectedSig, ...prev];
+      });
+    }
     setDiscoveredAccounts((prev) => prev.filter((a) => a.id !== account.id));
-    showToast(`Promoted ${account.name} to Tracked Target Accounts!`);
+    showToast(`Promoted ${account.name} to Tracked Accounts and ingested buying signal!`);
   };
 
   // Batch promote multiple discovered accounts into tracked target accounts
@@ -764,8 +735,10 @@ export default function App() {
             onUpdatePattern={handleUpdatePattern}
             onDeletePattern={handleDeletePattern}
             onResetToDefaults={handleResetPatternsToDefaults}
-            onTestInScanner={() => {
+            onTestInScanner={(pattern) => {
+              setScannerTestPattern(pattern);
               setActiveTab('scanner');
+              showToast(`Configured Signal Scanner for rule: "${pattern.name}"`);
             }}
           />
         )}
@@ -786,6 +759,9 @@ export default function App() {
 
         {activeTab === 'scanner' && (
           <ScannerView
+            trackedPatterns={trackedPatterns}
+            initialPattern={scannerTestPattern}
+            onClearInitialPattern={() => setScannerTestPattern(null)}
             onApplyDetectedSignal={(analysis) => {
               const compName = analysis.companyName || 'Discovered Enterprise';
               const existing = accounts.find(

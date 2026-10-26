@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Account, BuyingSignal } from '../types.ts';
 import { X, Upload, Download, FileText, Sparkles, Check, AlertCircle, Loader2, Copy, Building2 } from 'lucide-react';
+import { parseCSV, serializeToCSV } from '../utils/csvUtils.ts';
 
 interface ImportExportModalProps {
   isOpen: boolean;
@@ -15,8 +16,6 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
   accounts,
   onImportAccounts,
 }) => {
-  if (!isOpen) return null;
-
   const [activeTab, setActiveTab] = useState<'paste' | 'csv-import' | 'csv-export'>('paste');
 
   // Paste / Batch Search State
@@ -118,7 +117,7 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
     onClose();
   };
 
-  // CSV Parsing
+  // RFC-Compliant CSV Parsing (QAS-004)
   const handleCsvFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -131,45 +130,74 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
       if (!text) return;
 
       try {
-        const rows = text
-          .split('\n')
-          .map((r) => r.trim())
-          .filter(Boolean);
-        if (rows.length < 2) {
-          throw new Error('CSV must contain a header row and at least one data row.');
+        const { headers, rows } = parseCSV(text);
+        if (headers.length === 0 || rows.length === 0) {
+          throw new Error('CSV must contain a header row and at least one valid data row.');
         }
 
-        const headers = rows[0].split(',').map((h) => h.trim().toLowerCase().replace(/['"]/g, ''));
-        const nameIdx = headers.findIndex((h) => h.includes('name') || h.includes('company'));
-        const industryIdx = headers.findIndex((h) => h.includes('industry') || h.includes('sector'));
-        const toolsIdx = headers.findIndex((h) => h.includes('tool') || h.includes('eda') || h.includes('cad'));
-        const daemonsIdx = headers.findIndex((h) => h.includes('daemon') || h.includes('license'));
-        const spendIdx = headers.findIndex((h) => h.includes('spend') || h.includes('budget'));
-        const renewalIdx = headers.findIndex((h) => h.includes('renewal') || h.includes('window'));
+        const normalizedHeaders = headers.map((h) => h.toLowerCase().trim());
+        const findCol = (predicate: (h: string) => boolean) => {
+          const idx = normalizedHeaders.findIndex(predicate);
+          return idx >= 0 ? headers[idx] : null;
+        };
+
+        const nameKey = findCol((h) => h === 'account name' || h === 'company name' || h === 'name');
+        const tickerKey = findCol((h) => h === 'ticker');
+        const industryKey = findCol((h) => h === 'industry' || h === 'sector');
+        const headcountKey = findCol((h) => h === 'headcount' || h === 'total employees');
+        // QAS-004 Fix: Match EDA Engineers specifically, never confuse with EDA Tools
+        const seatsKey = findCol((h) => h === 'eda engineers' || h === 'seats' || h === 'cad/eda engineers');
+        const toolsKey = findCol((h) => h === 'eda tools' || h === 'tools' || h === 'cad/cae software');
+        const daemonsKey = findCol((h) => h === 'license daemons' || h === 'daemons' || h === 'license managers');
+        const esamKey = findCol((h) => h === 'current esam tool' || h === 'esam tool' || h === 'competitor');
+        const spendKey = findCol((h) => h === 'annual eda spend' || h === 'spend' || h === 'budget');
+        const renewalKey = findCol((h) => h === 'renewal quarter' || h === 'renewal window');
+        const renewalDaysKey = findCol((h) => h === 'renewal days left' || h === 'days left');
+        const icpKey = findCol((h) => h === 'icp fit score' || h === 'icp fit');
+        const intentKey = findCol((h) => h === 'intent velocity score' || h === 'intent velocity');
+        const compositeKey = findCol((h) => h === 'composite score' || h === 'score');
+        const priorityKey = findCol((h) => h === 'priority level' || h === 'priority');
+        const triggerKey = findCol((h) => h === 'primary trigger' || h === 'trigger');
+        const riskKey = findCol((h) => h === 'contention risk' || h === 'denial risk');
+        const notesKey = findCol((h) => h === 'notes');
 
         const parsed: Account[] = [];
-        for (let i = 1; i < rows.length; i++) {
-          const cols = rows[i].split(',').map((c) => c.trim().replace(/^["']|["']$/g, ''));
-          const companyName = cols[nameIdx >= 0 ? nameIdx : 0];
-          if (!companyName) continue;
+        rows.forEach((row, idx) => {
+          const companyName = nameKey ? row[nameKey]?.trim() : Object.values(row)[0]?.trim();
+          if (!companyName) return;
 
-          const industry = (cols[industryIdx >= 0 ? industryIdx : 1] as any) || 'Semiconductors';
-          const toolsStr = cols[toolsIdx >= 0 ? toolsIdx : 2] || 'Cadence Virtuoso; Synopsys Design Compiler';
-          const daemonsStr = cols[daemonsIdx >= 0 ? daemonsIdx : 3] || 'FlexNet (FLEXlm)';
-          const spend = cols[spendIdx >= 0 ? spendIdx : 4] || '$12M/yr';
-          const renewalQuarter = cols[renewalIdx >= 0 ? renewalIdx : 5] || 'Q2 2027';
+          // Parse actual seat count from CSV instead of hardcoding 750
+          const parsedSeats = seatsKey ? parseInt(row[seatsKey]?.replace(/[^0-9]/g, '') || '', 10) : NaN;
+          const seats = !isNaN(parsedSeats) && parsedSeats > 0 ? parsedSeats : 750;
 
-          const seats = 750;
+          const industryRaw = industryKey ? row[industryKey] : 'Semiconductors';
+          const industry = industryRaw?.includes('Aero')
+            ? 'Aerospace & Defense'
+            : industryRaw?.includes('Auto')
+            ? 'Automotive & EV'
+            : industryRaw?.includes('Industrial')
+            ? 'Industrial & Hardware'
+            : 'Semiconductors';
+
+          const toolsStr = toolsKey ? row[toolsKey] : 'Cadence Virtuoso; Synopsys Design Compiler';
+          const daemonsStr = daemonsKey ? row[daemonsKey] : 'FlexNet (FLEXlm)';
+          const esam = esamKey ? row[esamKey] : 'Manual Scripts';
+          const spend = spendKey ? row[spendKey] : `$${Math.round(seats * 0.012 + 4)}M/yr`;
+          const renewalQuarter = renewalKey ? row[renewalKey] : 'Q2 2027';
+          const renewalDaysLeft = renewalDaysKey ? parseInt(row[renewalDaysKey], 10) || 90 : 90;
+          const icpFitScore = icpKey ? parseInt(row[icpKey], 10) || 85 : 85;
+          const intentVelocityScore = intentKey ? parseInt(row[intentKey], 10) || 80 : 80;
+          const compositeScore = compositeKey ? parseInt(row[compositeKey], 10) || 82 : 82;
+          const priority = (priorityKey ? row[priorityKey] : 'High') as any;
+          const primaryTrigger = triggerKey ? row[triggerKey] : 'Imported via CSV - Engineering license tracking initiated';
+          const notes = notesKey ? row[notesKey] : 'Imported from customer GTM CSV spreadsheet.';
+
           parsed.push({
-            id: 'acc-csv-' + Date.now() + '-' + i,
+            id: 'acc-csv-' + Date.now() + '-' + idx,
             name: companyName,
-            ticker: '',
-            industry: industry.includes('Aero')
-              ? 'Aerospace & Defense'
-              : industry.includes('Auto')
-              ? 'Automotive & EV'
-              : 'Semiconductors',
-            headcount: '8,000',
+            ticker: tickerKey ? row[tickerKey] || '' : '',
+            industry,
+            headcount: headcountKey ? row[headcountKey] || `${seats * 6}` : '8,000',
             edaEngineersCount: seats,
             totalEngineersEstimate: seats * 3,
             qualificationStatus:
@@ -178,23 +206,28 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
                 : seats >= 500
                 ? 'Tier-2 Qualified (500–1,499 Seats)'
                 : 'Tier-3 Qualified (100–499 Seats)',
-            qualificationReason: 'Imported via CSV file with active floating license seats.',
-            headcountConfidence: 90,
+            qualificationReason: `Imported via verified CSV records with ${seats.toLocaleString()} concurrent engineering seats.`,
+            headcountConfidence: 92,
             annualEdaSpendEstimate: spend,
-            edaTools: toolsStr.split(/;/).map((t) => t.trim()).filter(Boolean),
-            licenseDaemons: daemonsStr.split(/;/).map((d) => d.trim()).filter(Boolean),
-            currentEsamTool: 'Manual Scripts',
+            edaTools: toolsStr ? toolsStr.split(/[;,]/).map((t) => t.trim()).filter(Boolean) : ['Cadence Virtuoso'],
+            licenseDaemons: daemonsStr ? daemonsStr.split(/[;,]/).map((d) => d.trim()).filter(Boolean) : ['FlexNet (FLEXlm)'],
+            currentEsamTool: esam || 'Manual Scripts',
             renewalQuarter,
-            renewalDaysLeft: 110,
-            icpFitScore: 84,
-            intentVelocityScore: 78,
-            compositeScore: 80,
-            priorityLevel: 'High',
-            primaryTrigger: 'Imported via CSV - Engineering license tracking initiated',
+            renewalDaysLeft,
+            icpFitScore,
+            intentVelocityScore,
+            compositeScore,
+            priorityLevel: priority === 'Very High' ? 'Very High' : 'High',
+            primaryTrigger,
             activeSignalsCount: 1,
-            denialContentionRisk: 'Elevated',
-            notes: 'Imported from customer GTM CSV spreadsheet.',
+            denialContentionRisk: riskKey ? (row[riskKey] as any) : 'Elevated',
+            notes,
+            isVerified: true,
           });
+        });
+
+        if (parsed.length === 0) {
+          throw new Error('No valid company records found in CSV file.');
         }
 
         setParsedCsvAccounts(parsed);
@@ -212,7 +245,7 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
     onClose();
   };
 
-  // CSV Export
+  // RFC-Compliant CSV Export with Formula Injection Defense (QAS-004, QAS-009)
   const handleDownloadCsv = () => {
     const headers = [
       'Account Name',
@@ -235,28 +268,28 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
       'Notes',
     ];
 
-    const rows = accounts.map((a) => [
-      `"${a.name}"`,
-      `"${a.ticker || ''}"`,
-      `"${a.industry}"`,
-      `"${a.headcount}"`,
+    const dataRows = accounts.map((a) => [
+      a.name,
+      a.ticker || '',
+      a.industry,
+      a.headcount,
       a.edaEngineersCount,
-      `"${a.annualEdaSpendEstimate}"`,
-      `"${a.edaTools.join('; ')}"`,
-      `"${a.licenseDaemons.join('; ')}"`,
-      `"${a.currentEsamTool}"`,
-      `"${a.renewalQuarter}"`,
+      a.annualEdaSpendEstimate,
+      a.edaTools.join('; '),
+      a.licenseDaemons.join('; '),
+      a.currentEsamTool,
+      a.renewalQuarter,
       a.renewalDaysLeft,
       a.icpFitScore,
       a.intentVelocityScore,
       a.compositeScore,
-      `"${a.priorityLevel}"`,
-      `"${a.primaryTrigger.replace(/"/g, '""')}"`,
-      `"${a.denialContentionRisk}"`,
-      `"${a.notes.replace(/"/g, '""')}"`,
+      a.priorityLevel,
+      a.primaryTrigger,
+      a.denialContentionRisk,
+      a.notes,
     ]);
 
-    const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+    const csvContent = serializeToCSV(headers, dataRows);
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -271,13 +304,13 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
   };
 
   const handleDownloadSampleTemplate = () => {
-    const sampleHeaders = 'Company Name,Industry,EDA Tools,License Daemons,Annual Spend,Renewal Quarter';
+    const sampleHeaders = ['Company Name', 'Industry', 'EDA Engineers', 'EDA Tools', 'License Daemons', 'Annual Spend', 'Renewal Quarter'];
     const sampleRows = [
-      'AMD,Semiconductors,Synopsys Fusion Compiler; Cadence Virtuoso,FlexNet (FLEXlm); Reprise (RLM),$45M/yr,Q1 2027',
-      'BAE Systems,Aerospace & Defense,Siemens NX; Dassault CATIA,DSLS; FlexNet (FLEXlm),$28M/yr,Q4 2026',
-      'General Motors Autonomous,Automotive & EV,Altair HyperWorks; Ansys Fluent,FlexNet (FLEXlm),$15M/yr,Q2 2027',
+      ['AMD', 'Semiconductors', 2400, 'Synopsys Fusion Compiler; Cadence Virtuoso', 'FlexNet (FLEXlm); Reprise (RLM)', '$45M/yr', 'Q1 2027'],
+      ['BAE Systems', 'Aerospace & Defense', 1100, 'Siemens NX; Dassault CATIA', 'DSLS; FlexNet (FLEXlm)', '$28M/yr', 'Q4 2026'],
+      ['General Motors Autonomous', 'Automotive & EV', 650, 'Altair HyperWorks; Ansys Fluent', 'FlexNet (FLEXlm)', '$15M/yr', 'Q2 2027'],
     ];
-    const content = [sampleHeaders, ...sampleRows].join('\n');
+    const content = serializeToCSV(sampleHeaders, sampleRows);
     const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -287,6 +320,9 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
     link.click();
     document.body.removeChild(link);
   };
+
+  // Guard JSX rendering: hooks are unconditionally declared at the top of the component
+  if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 overflow-hidden bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
